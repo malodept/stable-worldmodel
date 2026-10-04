@@ -85,3 +85,45 @@ def test_legacy_checkpoint_keeps_explicit_eval_fit_fallback(monkeypatch):
     )
     assert process['goal_state'] is process['state']
     assert process['goal_proprio'] is process['proprio']
+
+
+def test_checkpoint_artifact_roundtrip_drives_eval(tmp_path, monkeypatch):
+    import torch
+
+    from stable_worldmodel.wm.utils import save_pretrained
+
+    monkeypatch.setenv('STABLEWM_HOME', str(tmp_path))
+
+    state = ZScoreScaler(eps=1e-6).fit(
+        np.array([[0.0], [2.0], [4.0]], dtype=np.float64)
+    )
+    action = ZScoreScaler(eps=1e-6).fit(
+        np.array([[10.0], [20.0], [30.0]], dtype=np.float64)
+    )
+
+    save_pretrained(
+        torch.nn.Identity(),
+        run_name='modern',
+        config={'_target_': 'torch.nn.Identity'},
+        cache_dir=tmp_path,
+        preprocessing={'state': state, 'action': action},
+    )
+
+    cfg = SimpleNamespace(
+        dataset=SimpleNamespace(keys_to_cache=['state', 'action'])
+    )
+    process = get_policy_preprocessing(cfg, 'modern', _NoStatsDataset())
+
+    np.testing.assert_allclose(
+        process['state'].transform(np.array([[2.0]])),
+        [[0.0]],
+        rtol=0,
+        atol=0,
+    )
+    np.testing.assert_allclose(
+        process['action'].inverse_transform(np.array([[0.0]])),
+        [[20.0]],
+        rtol=0,
+        atol=0,
+    )
+    assert process['goal_state'] is process['state']
