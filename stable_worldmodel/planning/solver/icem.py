@@ -341,6 +341,14 @@ class ICEMSolver:
 
             var[start_idx:end_idx] = batch_var
 
+            # The EMA includes the initial mean, which may lie outside an
+            # asymmetric feasible interval. Candidate clipping alone does
+            # not guarantee that the returned mean is a feasible action.
+            if self._action_low is not None:
+                mean[start_idx:end_idx].clamp_(
+                    self._action_low, self._action_high
+                )
+
             outputs['costs'].extend(final_batch_cost)
 
         outputs['actions'] = mean.detach().cpu()

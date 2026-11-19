@@ -1,10 +1,11 @@
 from collections import deque
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from collections.abc import Callable
 
 import numpy as np
 import torch
+from gymnasium.spaces import Box
 from torchvision import tv_tensors
 
 from stable_worldmodel.buffer import HistoryBuffer
@@ -48,6 +49,12 @@ class PlanConfig:
             more raw history than you sample.
         action_block: Number of times each action is repeated (frameskip).
         warm_start: Whether to use the previous plan to initialize the next one.
+        model_action_bounds: Additional constraint in model/solver coordinates.
+            ``'legacy'`` (default) retains the historical numerical clamp
+            from the environment Box, intersected with physical feasibility.
+            ``None`` uses physical feasibility alone; a ``(low, high)`` pair
+            selects an explicit scalar model-space trust interval. Neither
+            mode allows actions outside the physical environment bounds.
     """
 
     horizon: int
@@ -56,6 +63,10 @@ class PlanConfig:
     history_max_len: int | None = None
     action_block: int = 1
     warm_start: bool = True
+    model_action_bounds: (
+        tuple[float, float] | Literal['legacy'] | None
+    ) = 'legacy'
+
 
     def __post_init__(self) -> None:
         if self.history_len < 1:
@@ -375,6 +386,113 @@ class WorldModelPolicy(BasePolicy):
         """Receding horizon in environment steps (with frameskip)."""
         return self.cfg.receding_horizon * self.cfg.action_block
 
+    def _planner_action_space(self, env_action_space):
+        """Express hard physical action bounds in the planner's coordinates.
+
+        Planner candidates and the world model use *preprocessed* actions;
+        only the final output is inverse-transformed for the environment.
+        ``model_action_bounds`` is an optional, separate model-space trust
+        interval intersected with the physical feasibility interval.
+
+        This construction requires an elementwise, order-preserving action
+        scaler (such as a fitted ZScoreScaler, PercentileScaler or
+        StandardScaler). Endpoint checks reject some invalid configurations,
+        including clipped percentile intervals with no feasible inverse.
+        """
+        trust = self.cfg.model_action_bounds
+        scaler = self.process.get('action')
+
+        if not isinstance(env_action_space, Box):
+            if trust not in (None, 'legacy'):
+                raise ValueError(
+                    'model_action_bounds requires a continuous Box action space'
+                )
+            return env_action_space
+
+        raw_low = np.asarray(env_action_space.low)
+        raw_high = np.asarray(env_action_space.high)
+        # Sampling solvers currently read action_space.low[0]/high[0] and
+        # share these limits across the batch. Do not silently allow a
+        # different Box for another environment in the batch.
+        if raw_low.ndim > 1 and raw_low.shape[0] > 1:
+            same_low = np.all(raw_low == raw_low[:1])
+            same_high = np.all(raw_high == raw_high[:1])
+            if not (same_low and same_high):
+                raise ValueError(
+                    'Heterogeneous per-environment action bounds are not '
+                    'supported by the current sampling solver interface'
+                )
+
+        if scaler is None and trust in (None, 'legacy'):
+            return env_action_space
+
+        if scaler is None:
+            low = raw_low.copy()
+            high = raw_high.copy()
+        else:
+            # Scalers are fitted to per-step vectors of shape (N, D).
+            low = np.asarray(
+                scaler.transform(raw_low.reshape(-1, raw_low.shape[-1]))
+            ).reshape(raw_low.shape)
+            high = np.asarray(
+                scaler.transform(raw_high.reshape(-1, raw_high.shape[-1]))
+            ).reshape(raw_high.shape)
+
+        if trust == 'legacy':
+            # Compatibility: previously the solver used these raw numerical
+            # bounds *as model coordinates*. Keep that implicit trust region
+            # wherever it is physically feasible.
+            low = np.maximum(low, raw_low)
+            high = np.minimum(high, raw_high)
+        elif trust is not None:
+            if isinstance(trust, str):
+                raise ValueError(f'Unknown model_action_bounds: {trust!r}')
+            if len(trust) != 2 or not np.all(np.isfinite(trust)):
+                raise ValueError(
+                    'model_action_bounds must be two finite numbers (low, high)'
+                )
+            trust_low, trust_high = trust
+            if trust_low >= trust_high:
+                raise ValueError('model_action_bounds requires low < high')
+            low = np.maximum(low, trust_low)
+            high = np.minimum(high, trust_high)
+
+        if np.any(np.isnan(low)) or np.any(np.isnan(high)):
+            raise ValueError('Action preprocessing produced NaN bounds')
+        if np.any(low > high):
+            raise ValueError(
+                'No feasible model actions: physical Box and model trust '
+                'region have an empty intersection'
+            )
+
+        # Quantile clipping may collapse an action interval outside the
+        # fitted data support to a point whose inverse is *not* feasible.
+        if scaler is not None:
+            inverse_low = np.asarray(
+                scaler.inverse_transform(low.reshape(-1, low.shape[-1]))
+            ).reshape(low.shape)
+            inverse_high = np.asarray(
+                scaler.inverse_transform(high.reshape(-1, high.shape[-1]))
+            ).reshape(high.shape)
+            tol = 1e-5
+            if (
+                np.any(inverse_low > inverse_high + tol)
+                or np.any(inverse_low < raw_low - tol)
+                or np.any(inverse_low > raw_high + tol)
+                or np.any(inverse_high < raw_low - tol)
+                or np.any(inverse_high > raw_high + tol)
+            ):
+                raise ValueError(
+                    'Action scaler cannot represent physically feasible '
+                    'actions in the requested model-space interval'
+                )
+
+        return Box(
+            low=np.asarray(low, dtype=np.float32),
+            high=np.asarray(high, dtype=np.float32),
+            dtype=np.float32,
+        )
+
     def set_env(self, env: Any) -> None:
         """Configure the policy and solver for the given environment.
 
@@ -384,7 +502,9 @@ class WorldModelPolicy(BasePolicy):
         self.env = env
         n_envs = getattr(env, 'num_envs', 1)
         self.solver.configure(
-            action_space=env.action_space, n_envs=n_envs, config=self.cfg
+            action_space=self._planner_action_space(env.action_space),
+            n_envs=n_envs,
+            config=self.cfg,
         )
         self._action_buffer = [
             deque(maxlen=self.flatten_receding_horizon) for _ in range(n_envs)
